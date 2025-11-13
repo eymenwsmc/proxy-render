@@ -4,8 +4,9 @@ FROM mcr.microsoft.com/playwright:latest
 WORKDIR /usr/src/app
 
 # package.json önce kopyala ve install et (cache için)
-COPY package.json package-lock.json* ./
-RUN npm ci --production
+COPY package.json ./ 
+RUN npm install --production
+
 
 # Kalan dosyaları kopyala
 COPY . .
