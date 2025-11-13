@@ -1,5 +1,5 @@
 # Playwright resmi image Chromium ve gerekli paketlerle gelir
-FROM mcr.microsoft.com/playwright:latest
+FROM mcr.microsoft.com/playwright:v1.56.1-jammy
 
 WORKDIR /usr/src/app
 
