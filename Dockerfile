@@ -14,5 +14,8 @@ COPY . .
 # Port (app içinde process.env.PORT kullanıyorsan Render bunu sağlar)
 EXPOSE 3000
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+
 # Start
 CMD ["node", "server.js"]
