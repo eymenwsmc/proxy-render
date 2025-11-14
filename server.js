@@ -5,6 +5,8 @@
 
 import express from "express";
 import { chromium } from "playwright";
+import path from "path";
+import fs from "fs";
 
 const PORT = process.env.PORT || 3000;
 const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || "3", 10);
@@ -12,6 +14,7 @@ const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "30000", 10); // ms
 const GOTO_WAIT = process.env.GOTO_WAIT || "networkidle"; // 'networkidle' or 'load'
 
 const app = express();
+app.use(express.json({ limit: "1mb" }));
 
 // Simple semaphore for concurrency control
 let active = 0;
@@ -34,24 +37,59 @@ function release() {
   }
 }
 
-let browser;
+// Use persistent context to keep cookies (cf_clearance) and session
+let persistentContext;
+const USER_DATA_DIR = path.join(process.cwd(), "user-data");
 
 async function startBrowser() {
-  console.log("Launching chromium...");
-  browser = await chromium.launch({
+  console.log("Launching chromium persistent context...");
+  if (!fs.existsSync(USER_DATA_DIR)) fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+
+  persistentContext = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-blink-features=AutomationControlled",
+      "--disable-features=IsolateOrigins,site-per-process",
+    ],
+    locale: "tr-TR",
+    timezoneId: "Europe/Istanbul",
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    viewport: { width: 1366, height: 768 },
+    colorScheme: "light",
   });
-  console.log("Chromium launched.");
+
+  // Basic stealth: remove webdriver flag, set plugins/languages
+  await persistentContext.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    Object.defineProperty(navigator, "languages", { get: () => ["tr-TR", "tr", "en-US", "en"] });
+    Object.defineProperty(navigator, "platform", { get: () => "Win32" });
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (parameter) {
+      // MASK_WEBGL_VENDOR_WEBGL, MASK_WEBGL_RENDERER
+      if (parameter === 37445) return "Intel Inc.";
+      if (parameter === 37446) return "Intel Iris OpenGL Engine";
+      return getParameter.call(this, parameter);
+    };
+    // plugins spoof
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [{ name: "Chrome PDF Plugin" }, { name: "Chrome PDF Viewer" }],
+    });
+  });
+
+  console.log("Chromium persistent context ready.");
 }
 
 async function stopBrowser() {
-  if (browser) {
+  if (persistentContext) {
     try {
-      await browser.close();
-      console.log("Chromium closed.");
+      await persistentContext.close();
+      console.log("Chromium context closed.");
     } catch (e) {
-      console.warn("Error closing browser:", e.message || e);
+      console.warn("Error closing context:", e.message || e);
     }
   }
 }
@@ -85,14 +123,8 @@ app.get("/render", async (req, res) => {
   await acquire();
   let page;
   try {
-    // Create context & page
-    const context = await browser.newContext({
-      userAgent: req.headers["user-agent"] || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-      locale: "tr-TR",
-      // optionally emulate viewport / device if needed
-    });
-
-    page = await context.newPage();
+    // Create a fresh page from persistent context (shared cookies/session)
+    page = await persistentContext.newPage();
 
     // optional headers
     await page.setExtraHTTPHeaders({
@@ -139,12 +171,19 @@ app.get("/render", async (req, res) => {
       }
     }
 
-    // For normal HTML: let page finish JS and return content
-    // Optionally we can wait for a selector known to appear, but networkidle is usually enough
-    const content = await page.content();
+    // Wait for Cloudflare managed challenge to auto-resolve if present
+    // Give it a few seconds and retry content read
+    await page.waitForTimeout(3000);
+    let content = await page.content();
+    let lower = content.toLowerCase();
+    if (lower.includes("just a moment") || lower.includes("cf-browser-verification") || lower.includes("__cf_chl_jschl_tk__")) {
+      // try waiting longer
+      await page.waitForTimeout(6000);
+      content = await page.content();
+      lower = content.toLowerCase();
+    }
 
     // Basic Cloudflare challenge detection: if found, return 403 with hint
-    const lower = content.toLowerCase();
     if (lower.includes("just a moment") || lower.includes("cf-browser-verification") || lower.includes("__cf_chl_jschl_tk__")) {
       res.status(403).send("Cloudflare challenge detected in rendered HTML. Playwright rendered the page but challenge present.");
     } else {
@@ -154,13 +193,64 @@ app.get("/render", async (req, res) => {
     }
 
     await page.close();
-    await context.close();
 
   } catch (err) {
     console.error("Render error:", err);
     if (page) try { await page.close(); } catch(_) {}
     res.status(500).send("Render error: " + String(err.message || err));
   } finally {
+    release();
+  }
+});
+
+// Download submit endpoint: posts within page context to reuse cookies and referer
+// POST /download-submit { url: string (optional, defaults to https://turkcealtyazi.org/ind), data: "idid=...&altid=...", refererPath?: string }
+app.post("/download-submit", async (req, res) => {
+  const url = normalizeUrl(req.body.url || "https://turkcealtyazi.org/ind");
+  const data = req.body.data;
+  const refererPath = typeof req.body.refererPath === "string" ? req.body.refererPath : "/";
+
+  if (!data || !/idid=\d+&altid=\d+/.test(String(data))) {
+    return res.status(400).json({ error: "Missing or invalid 'data' (expected idid=...&altid=...)" });
+  }
+
+  await acquire();
+  let page;
+  try {
+    page = await persistentContext.newPage();
+    await page.setExtraHTTPHeaders({ "accept-language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7" });
+
+    // Warm-up to same-origin page so browser auto-sets Referer header for fetch
+    await page.goto("https://turkcealtyazi.org" + refererPath, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+
+    // If challenge appears, give it time
+    await page.waitForTimeout(3000);
+
+    // Perform fetch within the page so cookies/headers are preserved
+    const result = await page.evaluate(async ({ postUrl, body }) => {
+      const resp = await fetch(postUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Accept": "*/*"
+        },
+        body,
+      });
+      const buf = await resp.arrayBuffer();
+      const headers = {};
+      resp.headers.forEach((v, k) => (headers[k] = v));
+      return { status: resp.status, ok: resp.ok, headers, base64: Buffer.from(buf).toString("base64") };
+    }, { postUrl: url, body: String(data) });
+
+    if (!result.ok) {
+      return res.status(result.status || 500).json({ success: false, error: "Target returned " + result.status });
+    }
+    return res.json({ success: true, data: result.base64, status_code: result.status, headers: result.headers, buffer_size: result.base64.length * 0.75 });
+  } catch (err) {
+    console.error("/download-submit error:", err);
+    return res.status(500).json({ success: false, error: String(err.message || err) });
+  } finally {
+    try { if (page) await page.close(); } catch(_) {}
     release();
   }
 });
